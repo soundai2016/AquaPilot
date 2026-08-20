@@ -1,0 +1,71 @@
+seed: 27
+output_dir: results/synthetic_full
+
+data:
+  kind: synthetic
+  n_subcarriers: 128
+  frames_per_sequence: 240
+  history: 16
+  horizon: 1
+  environments:
+    train: [calm_fjord, continental_shelf]
+    val: [busy_harbor]
+    test: [fast_tow]
+  sequences_per_environment:
+    train: 10
+    val: 4
+    test: 5
+
+model:
+  kind: aquapilot
+  hidden_dim: 64
+  rank: 4
+  conv_kernel: 5
+  dropout: 0.05
+  min_sigma: 0.001
+
+train:
+  torch_threads: 2
+  device: auto
+  batch_size: 64
+  epochs: 35
+  learning_rate: 0.0015
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  early_stopping_patience: 8
+  scheduler_patience: 3
+  min_delta: 0.00005
+  num_workers: 0
+
+pilot:
+  ratio: 0.125
+  training_mask_mode: mixed
+  extra_block_mask: 0.30
+  observation_sigma: 0.03
+  min_spacing: 3
+  gradient_weight: 0.0
+  update_length_scale: 5.0
+
+loss:
+  nll_weight: 1.0
+  nmse_weight: 0.35
+  causal_weight: 0.02
+  smooth_weight: 0.005
+  rank_weight: 0.0001
+  max_delay_bins: 24
+
+classical:
+  covariance_shrinkage: 0.05
+  max_covariance_frames: 10000
+  omp_delay_bins: 24
+  omp_sparsity: 6
+  omp_ridge: 0.000001
+
+eval:
+  mask_strategies: [comb, random, uncertainty, active]
+  run_classical: true
+  classical_receivers: [ls_interpolation, lmmse, omp]
+  snr_db: [0, 5, 10, 15, 20]
+  link_trials: 8
+  block_subcarriers: 16
+  code_rate: 0.5

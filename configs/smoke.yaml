@@ -1,0 +1,71 @@
+seed: 17
+output_dir: results/smoke
+
+data:
+  kind: synthetic
+  n_subcarriers: 48
+  frames_per_sequence: 96
+  history: 6
+  horizon: 1
+  environments:
+    train: [calm_fjord, continental_shelf]
+    val: [busy_harbor]
+    test: [fast_tow]
+  sequences_per_environment:
+    train: 3
+    val: 2
+    test: 2
+
+model:
+  kind: aquapilot
+  hidden_dim: 32
+  rank: 2
+  conv_kernel: 5
+  dropout: 0.03
+  min_sigma: 0.001
+
+train:
+  torch_threads: 1
+  device: cpu
+  batch_size: 32
+  epochs: 10
+  learning_rate: 0.002
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  early_stopping_patience: 4
+  scheduler_patience: 2
+  min_delta: 0.0001
+  num_workers: 0
+
+pilot:
+  ratio: 0.125
+  training_mask_mode: mixed
+  extra_block_mask: 0.20
+  observation_sigma: 0.03
+  min_spacing: 2
+  gradient_weight: 0.0
+  update_length_scale: 3.5
+
+loss:
+  nll_weight: 1.0
+  nmse_weight: 0.35
+  causal_weight: 0.01
+  smooth_weight: 0.003
+  rank_weight: 0.0001
+  max_delay_bins: 14
+
+classical:
+  covariance_shrinkage: 0.05
+  max_covariance_frames: 2000
+  omp_delay_bins: 14
+  omp_sparsity: 4
+  omp_ridge: 0.000001
+
+eval:
+  mask_strategies: [comb, random, uncertainty, active]
+  run_classical: true
+  classical_receivers: [ls_interpolation, lmmse, omp]
+  snr_db: [5, 10, 15]
+  link_trials: 3
+  block_subcarriers: 12
+  code_rate: 0.5
