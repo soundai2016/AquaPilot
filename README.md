@@ -1,6 +1,6 @@
 # AquaPilot
 
-Code for **AquaPilot: Uncertainty-Guided Active Pilot Sounding for Underwater OFDM** (WUWNet 2026 short paper).
+Code for **AquaPilot: Uncertainty-Guided Adaptive Pilot Placement for Underwater Acoustic OFDM** (WUWNet 2026 short paper).
 
 Repository: https://github.com/soundai2016/AquaPilot
 
