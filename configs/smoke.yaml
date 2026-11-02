@@ -36,11 +36,15 @@ train:
   scheduler_patience: 2
   min_delta: 0.0001
   num_workers: 0
+  noise_cache_mb: 128
+  log_every_batches: 100
 
 pilot:
   ratio: 0.125
   training_mask_mode: mixed
   extra_block_mask: 0.20
+  # Complex-noise RMS relative to sequence RMS; used in training and evaluation.
+  update_noise_convention: component
   observation_sigma: 0.03
   min_spacing: 2
   gradient_weight: 0.0
@@ -62,6 +66,9 @@ classical:
   omp_ridge: 0.000001
 
 eval:
+  # Validation/test histories use deterministic comb masks without block augmentation.
+  run_link_proxy: false
+  prediction_storage: compact
   mask_strategies: [comb, random, uncertainty, active]
   run_classical: true
   classical_receivers: [ls_interpolation, lmmse, omp]

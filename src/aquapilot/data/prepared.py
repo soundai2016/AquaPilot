@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -9,6 +10,39 @@ import torch
 from torch.utils.data import Dataset
 
 from aquapilot.pilots import comb_mask, random_mask
+
+
+def channel_sequence_rms(csi: np.ndarray) -> float:
+    """Reference RMS used only to set the replay's injected noise level."""
+    csi = np.asarray(csi)
+    if csi.ndim != 2 or not csi.size or not np.isfinite(csi).all():
+        raise ValueError("CSI must be a finite, nonempty [time, frequency] array.")
+    return float(np.sqrt(np.mean(np.abs(csi.astype(np.complex128)) ** 2)))
+
+
+def sequence_observation_noise(
+    csi: np.ndarray, fraction: float, seed: int,
+) -> tuple[np.ndarray, np.random.Generator]:
+    """Complex noise with E|n|^2 = (fraction * sequence_RMS)^2.
+
+    Draw real and imaginary components for the full record. Random pilot
+    selection continues from the state after both draws.
+    """
+    if not np.isfinite(fraction) or fraction < 0:
+        raise ValueError("The complex observation-noise RMS fraction must be nonnegative.")
+    reference_rms = max(channel_sequence_rms(csi), 1e-6)
+    return _noise_from_rms(csi.shape, fraction, seed, reference_rms)
+
+
+def _noise_from_rms(
+    shape: tuple[int, ...], fraction: float, seed: int, reference_rms: float,
+) -> tuple[np.ndarray, np.random.Generator]:
+    """Retain the full-sequence random stream while reusing a known RMS."""
+    rng = np.random.default_rng(seed)
+    standardized = (
+        rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    ).astype(np.complex64) / np.sqrt(2.0)
+    return float(fraction) * reference_rms * standardized, rng
 
 
 def _load_npz_sequence(path: Path) -> dict[str, Any]:
@@ -78,7 +112,7 @@ def interpolate_complex(observed: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
 
 class ChannelWindowDataset(Dataset[dict[str, torch.Tensor]]):
-    """Leakage-safe windows that never cross sequence boundaries."""
+    """History and target windows drawn from a single recording."""
 
     def __init__(
         self,
@@ -89,6 +123,9 @@ class ChannelWindowDataset(Dataset[dict[str, torch.Tensor]]):
         mask_mode: str = "mixed",
         extra_block_mask: float = 0.0,
         seed: int = 0,
+        observation_sigma: float = 0.03,
+        noise_seed: int | None = None,
+        noise_cache_mb: float = 128.0,
     ) -> None:
         self.sequences = list(sequences)
         self.history = int(history)
@@ -97,6 +134,16 @@ class ChannelWindowDataset(Dataset[dict[str, torch.Tensor]]):
         self.mask_mode = mask_mode
         self.extra_block_mask = float(extra_block_mask)
         self.seed = int(seed)
+        self.observation_sigma = float(observation_sigma)
+        self.noise_seed = self.seed if noise_seed is None else int(noise_seed)
+        if not np.isfinite(noise_cache_mb) or noise_cache_mb <= 0:
+            raise ValueError("noise_cache_mb must be a finite positive number.")
+        self.noise_cache_limit_bytes = int(float(noise_cache_mb) * 1024 * 1024)
+        self.noise_cache_bytes = 0
+        self._noise_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+        self._sequence_rms: list[float] = []
+        if not np.isfinite(self.observation_sigma) or self.observation_sigma < 0:
+            raise ValueError("observation_sigma is a nonnegative complex RMS fraction.")
         if self.history < 2 or self.horizon < 1:
             raise ValueError("history must be >=2 and horizon >=1.")
         if not 0.0 < self.pilot_ratio <= 1.0:
@@ -107,6 +154,9 @@ class ChannelWindowDataset(Dataset[dict[str, torch.Tensor]]):
             csi = np.asarray(sequence["csi"])
             if csi.ndim != 2:
                 raise ValueError(f"Sequence {sequence.get('id')} has shape {csi.shape}, expected [T,F].")
+            if not np.isfinite(csi).all():
+                raise ValueError(f"Sequence {sequence.get('id')} contains nonfinite CSI.")
+            self._sequence_rms.append(max(channel_sequence_rms(csi), 1e-6))
             if n_freq is None:
                 n_freq = csi.shape[1]
             elif csi.shape[1] != n_freq:
@@ -120,13 +170,14 @@ class ChannelWindowDataset(Dataset[dict[str, torch.Tensor]]):
     def __len__(self) -> int:
         return len(self.index)
 
-    def _masks(self, index: int, n_freq: int) -> np.ndarray:
+    def _masks(self, index: int, n_freq: int, frame_start: int | None = None) -> np.ndarray:
         rng = np.random.default_rng(self.seed + 7919 * index)
         budget = max(2, int(round(self.pilot_ratio * n_freq)))
         masks = np.zeros((self.history, n_freq), dtype=bool)
         for t in range(self.history):
             if self.mask_mode == "comb":
-                masks[t] = comb_mask(n_freq, budget, offset=(index + t) % max(1, n_freq // budget))
+                offset = (index if frame_start is None else frame_start) + t
+                masks[t] = comb_mask(n_freq, budget, offset=offset % max(1, n_freq // budget))
             elif self.mask_mode == "random":
                 masks[t] = random_mask(n_freq, budget, rng)
             elif self.mask_mode == "mixed":
@@ -144,15 +195,39 @@ class ChannelWindowDataset(Dataset[dict[str, torch.Tensor]]):
                     masks[t] = comb_mask(n_freq, budget)
         return masks
 
+    def _sequence_noise(self, sequence_index: int) -> np.ndarray:
+        """Byte-bounded LRU cache; eviction never changes the physical noise trace.
+
+        The budget applies separately to each dataset/worker process. A record
+        larger than the budget is generated on demand without being retained.
+        """
+        if sequence_index in self._noise_cache:
+            self._noise_cache.move_to_end(sequence_index)
+            return self._noise_cache[sequence_index]
+        noise, _ = _noise_from_rms(
+            np.asarray(self.sequences[sequence_index]["csi"]).shape,
+            self.observation_sigma,
+            self.noise_seed + 4241 * sequence_index,
+            self._sequence_rms[sequence_index],
+        )
+        if noise.nbytes <= self.noise_cache_limit_bytes:
+            while self._noise_cache and self.noise_cache_bytes + noise.nbytes > self.noise_cache_limit_bytes:
+                _, evicted = self._noise_cache.popitem(last=False)
+                self.noise_cache_bytes -= evicted.nbytes
+            self._noise_cache[sequence_index] = noise
+            self.noise_cache_bytes += noise.nbytes
+        return noise
+
     def __getitem__(self, item: int) -> dict[str, torch.Tensor]:
         seq_idx, start = self.index[item]
         sequence = self.sequences[seq_idx]
         csi = np.asarray(sequence["csi"], dtype=np.complex64)
         history = csi[start : start + self.history]
         target = csi[start + self.history + self.horizon - 1]
-        masks = self._masks(item, csi.shape[1])
+        masks = self._masks(item, csi.shape[1], frame_start=start)
 
-        observed = np.where(masks, history, 0.0 + 0.0j)
+        noise = self._sequence_noise(seq_idx)[start : start + self.history]
+        observed = np.where(masks, history + noise, 0.0 + 0.0j)
         filled = interpolate_complex(observed, masks)
         scale = float(np.sqrt(np.mean(np.abs(filled) ** 2)))
         scale = max(scale, 1e-6)

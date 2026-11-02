@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Convert an approved ACommSet release to leakage-aware AquaPilot CSI splits.
-
-The ACommSet archive has changed organization across releases. This converter is
-therefore explicit about the CSI variable and axes, never guesses a train/test
-split from file order, and records every decision in ``index.json``.
-"""
+"""Prepare complex channel responses from extracted ACommSet files."""
 from __future__ import annotations
 
 import argparse
+import hashlib
+import tempfile
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,7 +56,10 @@ def get_array(
             raise ValueError("Both --real-key and --imag-key are required together.")
         if real_key not in data or imag_key not in data:
             raise KeyError(f"Missing real/imag keys; available keys: {sorted(data)}")
-        return np.asarray(data[real_key]) + 1j * np.asarray(data[imag_key])
+        real, imag = np.asarray(data[real_key]), np.asarray(data[imag_key])
+        if real.shape != imag.shape or real.dtype.kind not in 'fiu' or imag.dtype.kind not in 'fiu':
+            raise ValueError('Real and imaginary arrays must be real-valued with identical shapes.')
+        return real + 1j * imag
     if key is None:
         candidates = [
             name
@@ -83,13 +83,17 @@ def split_from_path(path: Path) -> str | None:
 
 
 def convert_array(array: np.ndarray, time_axis: int, frequency_axis: int) -> list[np.ndarray]:
-    array = np.asarray(array).squeeze()
+    array = np.asarray(array)
     if array.ndim < 2:
         raise ValueError(f"CSI array must have at least two dimensions; got {array.shape}")
+    if any(axis < -array.ndim or axis >= array.ndim for axis in (time_axis, frequency_axis)):
+        raise ValueError(f'Time/frequency axes are outside the loaded array shape {array.shape}.')
     time_axis %= array.ndim
     frequency_axis %= array.ndim
     if time_axis == frequency_axis:
         raise ValueError("time_axis and frequency_axis must differ.")
+    if not np.iscomplexobj(array) and array.ndim-1 in (time_axis, frequency_axis):
+        raise ValueError('For packed real/imaginary data, reserve the last axis for the two components.')
     array = np.moveaxis(array, (time_axis, frequency_axis), (0, 1))
     if not np.iscomplexobj(array):
         if array.ndim >= 3 and array.shape[-1] == 2:
@@ -98,8 +102,11 @@ def convert_array(array: np.ndarray, time_axis: int, frequency_axis: int) -> lis
             raise ValueError(
                 "Selected CSI array is real. Use --real-key/--imag-key or provide a final RI dimension."
             )
+    array = np.asarray(array, dtype=np.complex64)
+    if not np.isfinite(array).all() or array.shape[1] < 2:
+        raise ValueError('Expected finite complex CSI on at least two source frequency bins.')
     if array.ndim == 2:
-        return [array.astype(np.complex64)]
+        return [array]
     flattened = array.reshape(array.shape[0], array.shape[1], -1)
     return [flattened[:, :, index].astype(np.complex64) for index in range(flattened.shape[-1])]
 
@@ -163,15 +170,16 @@ def save_sequence(
     destination_dir = output_root / split
     destination_dir.mkdir(parents=True, exist_ok=True)
     destination = destination_dir / f"{stem}_seq{channel_index:03d}_t{start:06d}-{stop:06d}.npz"
-    np.savez_compressed(
-        destination,
-        csi_real=csi.real.astype(np.float32),
-        csi_imag=csi.imag.astype(np.float32),
-        environment=np.asarray(environment),
-        source=np.asarray(str(source)),
-        source_start=np.asarray(start),
-        source_stop=np.asarray(stop),
-    )
+    with destination.open("xb") as handle:
+        np.savez_compressed(
+            handle,
+            csi_real=csi.real.astype(np.float32),
+            csi_imag=csi.imag.astype(np.float32),
+            environment=np.asarray(environment),
+            source=np.asarray(str(source)),
+            source_start=np.asarray(start),
+            source_stop=np.asarray(stop),
+        )
     return destination
 
 
@@ -200,17 +208,33 @@ def main() -> None:
     parser.add_argument("--history", type=int, default=16)
     args = parser.parse_args()
 
+    args.input, args.output = args.input.resolve(), args.output.resolve()
+    if args.input.is_relative_to(args.output) or args.output.is_relative_to(args.input):
+        parser.error('Keep the extracted source and prepared destination in separate directories.')
+    if args.output.exists() and (not args.output.is_dir() or any(args.output.iterdir())):
+        parser.error('Use a new or empty output directory; existing prepared data are not overwritten.')
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.acommset-', dir=args.output.parent) as work:
+        staging = Path(work) / 'prepared'
+        staging.mkdir()
+        counts = _prepare(args, staging)
+        # Same-filesystem atomic publication; a failed conversion leaves no usable partial split.
+        staging.rename(args.output)
+    print(f'Prepared {counts}; manifest: {args.output / "index.json"}')
+
+
+def _prepare(args: argparse.Namespace, staging: Path) -> dict[str, int]:
     files = sorted(
         path for path in args.input.rglob("*") if path.suffix.lower() in SUPPORTED_SUFFIXES
     )
     if not files:
         raise FileNotFoundError(f"No MAT/NPY/NPZ files found under {args.input}")
-    args.output.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, Any]] = []
-    failures: list[dict[str, str]] = []
     min_frames = int(args.history) + 1
 
     for path in files:
+        relative = path.relative_to(args.input).as_posix()
+        record_stem = path.stem + '_' + hashlib.sha256(relative.encode('utf-8')).hexdigest()[:16]
         try:
             data = load_container(path)
             array = get_array(data, args.key, args.real_key, args.imag_key)
@@ -245,9 +269,9 @@ def main() -> None:
                             f"need at least {min_frames}."
                         )
                     destination = save_sequence(
-                        args.output,
+                        staging,
                         segment.split,
-                        path.stem,
+                        record_stem,
                         segment_csi,
                         environment,
                         path,
@@ -258,37 +282,42 @@ def main() -> None:
                     records.append(
                         {
                             "source": str(path),
-                            "prepared": str(destination.relative_to(args.output)),
+                            "prepared": str(destination.relative_to(staging)),
                             "split": segment.split,
                             "environment": environment,
                             "channel_index": channel_index,
+                            "source_relative_path": relative,
+                            "source_frequency_bins": int(raw_csi.shape[1]),
                             "source_interval": [segment.start, segment.stop],
                             "shape": list(segment_csi.shape),
                         }
                     )
         except Exception as exc:  # noqa: BLE001 - independent archive files may differ
-            failures.append({"source": str(path), "error": str(exc)})
+            raise ValueError(f"Failed to prepare {relative}: {exc}. No split was published.") from exc
 
     manifest = {
-        "format": "AquaPilot prepared CSI v1",
+        "format": "AquaPilot prepared CSI",
         "source_dataset": "ACommSet (user-approved local copy)",
         "split_mode": args.split_mode,
         "n_subcarriers": args.n_subcarriers,
         "history": args.history,
+        "variable": {"key": args.key, "real_key": args.real_key, "imag_key": args.imag_key},
+        "loaded_array_axes": {"time": args.time_axis, "frequency": args.frequency_axis},
+        "frequency_mapping": "linear interpolation of real/imaginary components on normalized band coordinate; not an absolute-Hz alignment",
         "train_ratio": args.train_ratio if args.split_mode == "continuous" else None,
         "val_ratio": args.val_ratio if args.split_mode == "continuous" else None,
         "guard_frames": args.guard_frames if args.split_mode == "continuous" else None,
         "records": records,
-        "failures": failures,
+        "failures": [],
     }
-    index_path = args.output / "index.json"
+    index_path = staging / "index.json"
     index_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     if not records:
         raise RuntimeError(
             f"No ACommSet sequences converted. Inspect {index_path} failures and key/axis arguments."
         )
     counts = {split: sum(record["split"] == split for record in records) for split in ("train", "val", "test")}
-    print(f"Converted {len(records)} segments {counts}; failures={len(failures)}; manifest={index_path}")
+    return counts
 
 
 if __name__ == "__main__":

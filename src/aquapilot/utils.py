@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +50,7 @@ def json_ready(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        return json_ready(value.tolist())
     if isinstance(value, (np.floating, np.integer)):
         return value.item()
     if torch.is_tensor(value):
@@ -60,10 +61,43 @@ def json_ready(value: Any) -> Any:
 
 
 def save_json(path: str | Path, payload: Any) -> None:
+    """Write a complete standards-compliant JSON document atomically."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(json_ready(payload), handle, indent=2, sort_keys=True)
+    content = json.dumps(json_ready(payload), indent=2, sort_keys=True, allow_nan=False) + "\n"
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = handle.name
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def save_torch_checkpoint(path: str | Path, payload: dict[str, Any]) -> None:
+    """Replace a checkpoint only after its complete serialization is on disk."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = handle.name
+            torch.save(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def count_parameters(model: torch.nn.Module) -> int:

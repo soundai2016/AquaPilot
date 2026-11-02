@@ -7,8 +7,11 @@ import sys
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-import requests
-from bs4 import BeautifulSoup
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except ModuleNotFoundError as error:
+    raise SystemExit("Install the download dependencies: python -m pip install -e '.[download]'") from error
 
 OFFICIAL_PAGE = "https://www.ffi.no/en/research/watermark"
 
@@ -30,7 +33,7 @@ def resolve_download_url(session: requests.Session) -> str:
         )
     for candidate in candidates:
         host = urlparse(candidate).hostname or ""
-        if host.endswith("ffi.no"):
+        if host == "ffi.no" or host.endswith(".ffi.no"):
             return candidate
     raise RuntimeError("The page exposed candidates, but none were hosted by ffi.no; refusing third-party downloads.")
 
@@ -49,7 +52,7 @@ def main() -> None:
     args = parser.parse_args()
 
     session = requests.Session()
-    session.headers.update({"User-Agent": "AquaPilot-research-artifact/0.1 (+WUWNet reproducibility)"})
+    session.headers.update({"User-Agent": "AquaPilot"})
     if args.resolve_only:
         print(resolve_download_url(session))
         return

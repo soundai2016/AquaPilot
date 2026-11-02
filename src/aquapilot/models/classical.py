@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -11,6 +12,29 @@ class ComplexFrequencyPrior:
     mean: np.ndarray
     covariance: np.ndarray
     shrinkage: float
+    fit_records: tuple[dict[str, Any], ...] = ()
+    fit_indices: tuple[np.ndarray, ...] = ()
+
+
+def _training_allocation(lengths: np.ndarray, max_frames: int | None) -> np.ndarray:
+    """Guarantee one frame per record; apportion the rest by residual capacity."""
+    available = int(lengths.sum())
+    if max_frames is not None and (not isinstance(max_frames, (int, np.integer)) or max_frames < 2):
+        raise ValueError("max_frames must be None or an integer of at least two.")
+    budget = available if max_frames is None else min(int(max_frames), available)
+    if budget < 2:
+        raise ValueError("At least two training frames are required to fit an LMMSE prior.")
+    if budget < len(lengths):
+        raise ValueError("max_covariance_frames must cover at least one frame from each training record.")
+    if budget == available:
+        return lengths.copy()
+    capacity = lengths - 1
+    numerator = (budget - len(lengths)) * capacity
+    shares, remainder = np.divmod(numerator, capacity.sum())
+    counts = 1 + shares
+    extra = budget - int(counts.sum())
+    counts[np.argsort(-remainder, kind="stable")[:extra]] += 1
+    return counts
 
 
 def fit_frequency_prior(
@@ -20,32 +44,48 @@ def fit_frequency_prior(
 ) -> ComplexFrequencyPrior:
     """Fit a training-only proper-complex frequency covariance.
 
-    Each contiguous sequence is RMS-normalized once. This removes arbitrary
-    recording gain while preserving frame-to-frame fades that a current-frame
-    LMMSE receiver must represent. A small diagonal shrinkage keeps pilot
-    submatrices invertible.
+    Normalize each training record by its RMS. When the cap binds, sample
+    across every record and throughout its duration, with one draw per time
+    stratum. Sampling depends on the record identity, not the network seed.
     """
-    frames: list[np.ndarray] = []
-    for sequence in sequences:
+    records = []
+    for i, sequence in enumerate(sequences):
         csi = np.asarray(sequence["csi"])
-        if csi.ndim != 2:
-            raise ValueError("Each sequence must contain csi with shape [time, frequency].")
+        if csi.ndim != 2 or min(csi.shape) < 1:
+            raise ValueError("Each training sequence must contain nonempty [time, frequency] CSI.")
+        record_id = str(sequence.get("id", f"record_{i}"))
+        records.append((str(sequence.get("environment", "unspecified")), record_id, csi))
+    records.sort(key=lambda row: row[:2])
+    if len({row[:2] for row in records}) != len(records):
+        raise ValueError("LMMSE fitting requires distinct training record identities within an environment.")
+    if len({row[2].shape[1] for row in records}) > 1:
+        raise ValueError("Training records must use the same frequency grid.")
+    lengths = np.array([len(row[2]) for row in records], dtype=np.int64)
+    counts = _training_allocation(lengths, max_frames)
+    frames, fit_records, fit_indices = [], [], []
+    for (environment, record_id, csi), length, count in zip(records, lengths, counts):
+        if count == length:
+            indices = np.arange(length, dtype=np.int64)
+        else:
+            key = f"{environment}\0{record_id}".encode("utf-8")
+            seed = int.from_bytes(hashlib.sha256(key).digest()[:8], "little")
+            edges = (np.arange(count + 1, dtype=np.int64) * length) // count
+            indices = np.random.default_rng(seed).integers(edges[:-1], edges[1:], dtype=np.int64)
         scale = max(float(np.sqrt(np.mean(np.abs(csi) ** 2))), 1e-8)
-        frames.extend(np.asarray(frame, dtype=np.complex128) / scale for frame in csi)
-        if max_frames is not None and len(frames) >= max_frames:
-            frames = frames[:max_frames]
-            break
-    if len(frames) < 2:
-        raise ValueError("At least two training frames are required to fit an LMMSE prior.")
-    matrix = np.stack(frames, axis=0)
+        frames.append(np.asarray(csi[indices], dtype=np.complex128) / scale)
+        fit_records.append({"environment": environment, "record_id": record_id,
+                            "available_frames": int(length), "used_frames": int(count)})
+        fit_indices.append(indices)
+    matrix = np.concatenate(frames, axis=0)
     mean = matrix.mean(axis=0)
     centered = matrix - mean[None, :]
-    covariance = centered.conj().T @ centered / max(matrix.shape[0] - 1, 1)
+    covariance = centered.T @ centered.conj() / max(matrix.shape[0] - 1, 1)
     covariance = 0.5 * (covariance + covariance.conj().T)
     alpha = float(np.clip(shrinkage, 0.0, 1.0))
     average_variance = max(float(np.real(np.trace(covariance)) / covariance.shape[0]), 1e-8)
     covariance = (1.0 - alpha) * covariance + alpha * average_variance * np.eye(covariance.shape[0])
-    return ComplexFrequencyPrior(mean=mean.astype(np.complex128), covariance=covariance, shrinkage=alpha)
+    return ComplexFrequencyPrior(mean=mean, covariance=covariance, shrinkage=alpha,
+                                 fit_records=tuple(fit_records), fit_indices=tuple(fit_indices))
 
 
 def interpolate_observation(observation: np.ndarray, mask: np.ndarray) -> np.ndarray:

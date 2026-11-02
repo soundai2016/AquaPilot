@@ -41,8 +41,7 @@ def generate_episode(
 
     The generator is deliberately modest: a sum of continuously drifting paths,
     colored AR amplitudes, common clock/phase drift, smooth absorption, and an
-    optional moving spectral notch. It is a sanity-check source, not a substitute
-    for Watermark or at-sea data.
+    optional moving spectral notch.
     """
     if n_frames < 4 or n_subcarriers < 8:
         raise ValueError("Synthetic episodes require at least 4 frames and 8 subcarriers.")

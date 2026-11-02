@@ -50,7 +50,11 @@ def active_variance_reduction_mask(
     observation_sigma: float = 0.03,
     gradient_weight: float = 0.0,
 ) -> np.ndarray:
-    """Select an exact pilot budget by greedy A-optimal trace reduction."""
+    """Greedy A-optimal selection; observation_sigma is per real component.
+
+    A circular complex noise RMS must be divided by sqrt(2) before calling.
+    The caller may explicitly retain the original larger variance for replay.
+    """
     mean_ri = np.asarray(mean_ri, dtype=np.float64)
     sigma_ri = np.asarray(sigma_ri, dtype=np.float64)
     if mean_ri.shape != sigma_ri.shape or mean_ri.ndim != 2 or mean_ri.shape[1] != 2:
@@ -155,7 +159,11 @@ def posterior_kernel_update(
     observation_sigma: float = 0.03,
     length_scale: float = 4.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply the matched Gaussian update and return posterior marginals."""
+    """Apply the common Gaussian update and return component marginals.
+
+    observation_sigma is the standard deviation of each real/imaginary
+    observation component, in the same normalized units as prior_mean.
+    """
     if prior_mean.ndim != 3 or prior_mean.shape[-1] != 2:
         raise ValueError("prior_mean must have shape [B,F,2].")
     if prior_sigma.shape != prior_mean.shape or observation.shape != prior_mean.shape:

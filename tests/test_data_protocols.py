@@ -4,6 +4,7 @@ import numpy as np
 from scipy.io import savemat
 
 from scripts.prepare_acommset import chronological_segments, resample_frequency
+from aquapilot.watermark_grid import BANKS
 from scripts.prepare_watermark import environment_group
 from scripts.prepare_watermark_loeo import GROUPS
 
@@ -63,9 +64,10 @@ def test_watermark_loeo_converter_keeps_kau_together(tmp_path: Path):
     for index, code in enumerate(("NOF1", "NCS1", "BCH1", "KAU1", "KAU2")):
         rng = np.random.default_rng(index)
         h = (
-            rng.standard_normal((20, 32)) + 1j * rng.standard_normal((20, 32))
+            rng.standard_normal((20, 128)) + 1j * rng.standard_normal((20, 128))
         ).astype(np.complex64)
-        savemat(raw / f"{code}_fixture.mat", {"h": h, "fc": 12_000.0})
+        _, band, slow, rate = BANKS[code]
+        savemat(raw / f"{code}_fixture.mat", {"h": h, "fc": sum(band)/2,"fs_t":slow,"fs_tau":rate})
     subprocess.run(
         [
             sys.executable,

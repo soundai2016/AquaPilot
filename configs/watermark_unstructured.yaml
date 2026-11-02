@@ -1,10 +1,11 @@
 # Parameter-controlled neural ablation for one Watermark fold.
 seed: 37
-output_dir: results/watermark_unstructured/fold_test_KAU/ratio_0.125/seed_37
+output_dir: results/watermark_inband_unstructured/fold_test_KAU/ratio_0.125/seed_37
 
 data:
   kind: prepared
-  root: data/prepared/watermark/fold_test_KAU
+  n_subcarriers: 128
+  root: data/prepared/watermark_inband/fold_test_KAU
   history: 16
   horizon: 1
 
@@ -28,11 +29,15 @@ train:
   scheduler_patience: 3
   min_delta: 0.00005
   num_workers: 0
+  noise_cache_mb: 128
+  log_every_batches: 100
 
 pilot:
   ratio: 0.125
   training_mask_mode: mixed
   extra_block_mask: 0.35
+  # Complex-noise RMS relative to sequence RMS; used in training and evaluation.
+  update_noise_convention: component
   observation_sigma: 0.03
   min_spacing: 3
   gradient_weight: 0.0
@@ -54,6 +59,9 @@ classical:
   omp_ridge: 0.000001
 
 eval:
+  # Validation/test histories use deterministic comb masks without block augmentation.
+  run_link_proxy: false
+  prediction_storage: compact
   mask_strategies: [comb, random, uncertainty, active]
   run_classical: false
   snr_db: [0, 5, 10, 15, 20]
