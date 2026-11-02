@@ -12,7 +12,7 @@ import pytest
 from aquapilot.data.audit import EXPECTED_COUNTS, _inventory
 from aquapilot.provenance import PROTOCOL_ID, file_fingerprint, fingerprint
 from aquapilot.analysis import conditional_seed_interval
-from scripts.build_result_tables import ENVIRONMENTS, FRACTIONS, INPUT_FILES, POLICIES, SEEDS, build_tables, latex_escape
+from scripts.build_result_tables import ENVIRONMENTS, FRACTIONS, INPUT_FILES, POLICIES, SEEDS, build_tables
 
 
 def write_json(path: Path, value) -> None:
@@ -131,19 +131,27 @@ def analysis_fixture(tmp_path):
 def test_full_constructed_fixture_exports_numbers_and_provenance(analysis_fixture, tmp_path):
     output = tmp_path / "fixture_tables"
     manifest = build_tables(analysis_fixture, output)
-    main = (output / "main_results.tex").read_text()
-    assert "1/16 & Comb & $0.22 \\pm 0.11$ & $101.1 \\pm 0.6$" in main
-    paired = (output / "paired_top_b_025.tex").read_text()
-    assert "NOF & $-0.200$ & $-0.210$ & $-0.220$ & $-0.210$" in paired
-    assert "95\\%" in paired and "three seed blocks" in paired
-    assert "NOF & $-0.128$ (0)" in (output / "ranking_by_environment.tex").read_text()
+    main = read_csv(output / "main_results.csv")
+    assert len(main) == 12
+    comb = next(row for row in main if row["policy"] == "comb" and float(row["pilot_fraction"]) == 0.0625)
+    raw = [index * 0.1 + seed_index * 0.01 + 0.0625 for index in range(4) for seed_index in range(3)]
+    assert float(comb["nmse_db_mean"]) == statistics.mean(raw)
+    assert float(comb["channel_nrmse_percent_sd"]) == statistics.pstdev(100 + 5 * v for v in raw)
+    paired = read_csv(output / "paired_top_b_025.csv")
+    nof = next(row for row in paired if row["environment"] == "NOF")
+    assert [float(nof[f"seed_{seed}_delta_db"]) for seed in SEEDS] == pytest.approx([-0.20, -0.21, -0.22])
+    summary, = read_csv(output / "paired_summary_025.csv")
+    assert (summary["num_pairs"], summary["wins"], summary["num_seed_blocks"]) == ("12", "12", "3")
+    expected = conditional_seed_interval(dict(zip(SEEDS, [-0.20, -0.21, -0.22])))
+    assert float(summary["t95_lower_db"]) == pytest.approx(expected["t_lower"])
+    ranks = read_csv(output / "ranking_by_environment.csv")
+    assert float(ranks[0]["equal_seed_mean_frame_spearman"]) == pytest.approx(-0.1275)
+    assert (ranks[0]["num_undefined_frames"], ranks[0]["num_defined_seeds"]) == ("0", "3")
     assert len(manifest["source_metrics"]) == 36
     assert manifest["main_sd_ddof"] == 0
-    assert file_fingerprint(output / "main_results.tex") == manifest["outputs"]["main_results.tex"]
-
-
-def test_latex_escaping_handles_control_characters():
-    assert latex_escape(r"A&B_1%$#{}\~^") == r"A\&B\_1\%\$\#\{\}\textbackslash{}\textasciitilde{}\textasciicircum{}"
+    assert {p.name for p in output.iterdir()} == {*manifest["outputs"], "tables_manifest.json"}
+    assert all(name.endswith(".csv") and file_fingerprint(output / name) == identity
+               for name, identity in manifest["outputs"].items())
 
 
 @pytest.mark.parametrize("change", [
@@ -199,11 +207,11 @@ def test_nonfinite_ranking_is_not_printed_as_blank(analysis_fixture, tmp_path):
 def test_existing_table_directory_is_preserved(analysis_fixture, tmp_path):
     output = tmp_path / "existing"
     output.mkdir()
-    original = output / "main_results.tex"
-    original.write_text("existing author edits")
+    original = output / "main_results.csv"
+    original.write_text("existing results")
     with pytest.raises(FileExistsError):
         build_tables(analysis_fixture, output)
-    assert original.read_text() == "existing author edits"
+    assert original.read_text() == "existing results"
 
 
 def change_completed_result(analysis, path, update):
@@ -256,5 +264,9 @@ def test_undefined_rank_seed_preserves_other_tables(analysis_fixture, tmp_path):
     refresh_analysis_hash(analysis_fixture, path.name)
     output = tmp_path/'tables'
     build_tables(analysis_fixture, output)
-    assert r"\textsc{na} ("+str(n)+")" in (output/'ranking_by_environment.tex').read_text()
-    assert (output/'paired_top_b_025.tex').is_file()
+    rankings = read_csv(output / "ranking_by_environment.csv")
+    row = next(r for r in rankings if r["environment"] == item["environment"]
+               and r["pilot_fraction"] == item["pilot_fraction"])
+    assert row["equal_seed_mean_frame_spearman"] == ""
+    assert (row["num_defined_seeds"], row["num_undefined_frames"]) == ("2", str(n))
+    assert (output / "paired_top_b_025.csv").is_file()

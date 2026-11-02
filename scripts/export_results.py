@@ -56,7 +56,8 @@ def _verify_analysis(results: Path, analysis: Path, stage: Path, diagnostic: boo
     full = report.get('expected_watermark_matrix') is True and report.get('matrix_complete') is True
     if not diagnostic and not (full and report.get('run_mode') == 'fresh_training'
             and report.get('declared_source_statuses') == ['measured-channel experiment']
-            and report.get('input_data_kinds') == ['prepared'] and report.get('num_runs') == 36):
+            and report.get('input_data_kinds') == ['prepared'] and report.get('num_runs') == 36
+            and report.get('noise_convention') == 'component'):
         raise ValueError('Expected the complete measured Watermark fresh-training matrix; use --diagnostic for a diagnostic archive.')
     _check_source_files(analysis, report)
     # Use the current directory inventory. A stale summary can be internally hash-consistent
@@ -68,6 +69,38 @@ def _verify_analysis(results: Path, analysis: Path, stage: Path, diagnostic: boo
         changed = sorted(k for k in set(fresh) | set(report) if fresh.get(k) != report.get(k))
         raise ValueError('Analysis does not reproduce from the current source runs (' + ', '.join(changed) + '). Regenerate the analysis.')
     return fresh
+
+
+def _check_measured_runs(sources: dict[str, str], cells: set[tuple], configuration: bytes) -> None:
+    """Check configuration values against each original receiver and held-out recording."""
+    from aquapilot.analysis import POLICIES, load_run
+    from aquapilot.verification import same
+    from aquapilot.watermark_grid import BANKS
+
+    by_hash = {digest: (env, seed, fraction) for env, seed, fraction, digest in cells}
+    rows = {(row["metrics_sha256"], row["policy"]): row for row in
+            csv.DictReader(io.StringIO(configuration.decode("utf-8")))}
+    for source, digest in sources.items():
+        path = Path(source)
+        run = load_run(path)
+        env, seed, fraction = by_hash[digest]
+        cfg = run.manifest["resolved_config"]
+        if (file_fingerprint(path)["sha256"] != digest or run.seed != seed or run.fraction != fraction or
+                cfg["model"].get("kind", "aquapilot") != "aquapilot" or cfg["data"].get("history", 8) != 16 or
+                cfg["data"].get("horizon", 1) != 1 or cfg["data"].get("n_subcarriers", 128) != 128):
+            raise ValueError(f"{env}, seed {seed}: source identity, model or grid settings differ.")
+        test_files = run.manifest["data"]["main"]["splits"]["test"]
+        expected = {(Path(item["path"]).stem, env): BANKS[Path(item["path"]).stem.split("_", 1)[0]][0][0] - 16
+                    for item in test_files}
+        for policy in POLICIES:
+            receiver = run.result["closed_loop"][policy]
+            actual = {(r["record_id"], r["environment"]): r["num_frames"] for r in receiver["records"]}
+            if actual != expected or len(actual) != len(receiver["records"]):
+                raise ValueError(f"{env}: {policy} scored a different record inventory or number of soundings.")
+            same(receiver["pilot_ratio"], fraction, "realized pilot fraction")
+            row = rows[digest, policy]
+            for field in ("num_frames", "num_valid_error_frames", "nmse_db_mean", "channel_nrmse_percent_mean"):
+                same(row[field], receiver["posterior"][field], f"{env}/{policy} {field}")
 
 
 def export_bundle(results: Path, output: Path, *, diagnostic: bool = False, analysis: Path | None = None) -> dict:
@@ -87,17 +120,6 @@ def export_bundle(results: Path, output: Path, *, diagnostic: bool = False, anal
         for name in (*BASE_TABLES, *(n for n in EXTRA_TABLES if n in report['analysis_artifacts'])):
             path = stage / name
             payload[name] = _source_table(path, sources) if path.suffix == '.csv' else path.read_bytes()
-        if not diagnostic:
-            from aquapilot.result_figure import rank_placement_pdf
-            from scripts.build_result_tables import build_tables
-
-            tables = Path(scratch) / 'tables'
-            exported = build_tables(stage, tables)
-            for name in exported['outputs']:
-                if Path(name).name != name or Path(name).suffix not in {'.tex', '.txt'}:
-                    raise ValueError(f'Unexpected table output: {name}')
-                payload['tables/' + name] = (tables / name).read_bytes()
-            payload['rank_placement.pdf'] = rank_placement_pdf(payload['ranking_placement_by_environment.csv'])
         source_kinds = set(report['input_data_kinds'])
         status = set(report['declared_source_statuses'])
         if 'synthetic' in source_kinds or any('synthetic' in item.lower() for item in status):
@@ -111,7 +133,7 @@ def export_bundle(results: Path, output: Path, *, diagnostic: bool = False, anal
         for row in input_rows:
             cells.add((row['environment'], int(row['seed']), float(row['pilot_fraction']), row['metrics_sha256']))
         manifest = {
-            'bundle_schema_version': 1, 'protocol_id': PROTOCOL_ID,
+            'bundle_schema_version': 2, 'protocol_id': PROTOCOL_ID, 'table_format': 'numeric',
             'protocol_fingerprint': report['protocol_fingerprint'], 'run_mode': report['run_mode'],
             'classification': 'diagnostic only' if diagnostic else 'complete measured Watermark fresh-training analysis',
             'input_classification': data_status, 'includes_result_tables': not diagnostic,
@@ -125,6 +147,13 @@ def export_bundle(results: Path, output: Path, *, diagnostic: bool = False, anal
             'members': {name: {'size_bytes': len(value), 'sha256': hashlib.sha256(value).hexdigest()}
                         for name, value in sorted(payload.items())},
         }
+        if not diagnostic:
+            from aquapilot.verification import FORMAL_MEMBERS, verify_numeric_tables
+
+            if set(payload) != FORMAL_MEMBERS:
+                raise ValueError("Incomplete corrected numerical tables.")
+            _check_measured_runs(sources, cells, payload["configuration_metrics.csv"])
+            verify_numeric_tables(manifest, payload)
         payload['bundle_manifest.json'] = _json_bytes(manifest)
         output.parent.mkdir(parents=True, exist_ok=True)
         # Publish a complete archive only. Concurrent exports cannot overwrite an existing ZIP.
@@ -148,7 +177,7 @@ def main(argv=None) -> None:
     parser.add_argument('--prepared-root', type=Path, default=Path('data/prepared/watermark'), help='Earlier training folds for matching to saved input hashes')
     parser.add_argument('--axes', type=Path, help='Corrected-run axes.json (default: beside the model directory or input ZIP)')
     parser.add_argument('--full-audit', action='store_true', help='For legacy results, compare all 156 original records instead of one per channel bank')
-    parser.add_argument('--diagnostic', action='store_true', help='For a partial or synthetic current-protocol run: export diagnostics without manuscript sources')
+    parser.add_argument('--diagnostic', action='store_true', help='For a partial or synthetic current-protocol run: export available numerical diagnostics')
     args = parser.parse_args(argv)
     manifest, output = handoff(PROJECT_ROOT, args, export_bundle)
     print(f"Mode: {manifest['classification']} | fits: {manifest['num_runs']}")

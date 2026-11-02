@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build LaTeX tables from the complete measured Watermark experiment."""
+"""Export numerical CSV summaries from the complete measured Watermark experiment."""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +8,7 @@ import itertools
 import json
 import math
 import statistics
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -21,19 +22,11 @@ ENVIRONMENTS = ("NOF", "NCS", "BCH", "KAU")
 SEEDS = (17, 37, 57)
 FRACTIONS = (0.0625, 0.125, 0.25)
 POLICIES = ("comb", "random", "uncertainty", "active")
-LABELS = {"comb": "Comb", "random": "Random", "uncertainty": "Uncertainty top-$B$", "active": "A-optimal"}
 MEASURED_STATUS = {"fresh_training": "measured-channel experiment",
                    "checkpoint_reevaluation": "fixed-checkpoint measured-channel reevaluation"}
 INPUT_FILES = ("analysis_summary.json", "configuration_metrics.csv", "aggregate_metrics.csv",
                "paired_top_b_025.csv", "paired_by_environment.csv", "paired_summary.json",
                "prior_ranking_by_environment.csv", "prior_ranking_by_run.csv")
-
-
-def latex_escape(value: str) -> str:
-    substitutions = {"\\": r"\textbackslash{}", "&": r"\&", "%": r"\%", "$": r"\$",
-                     "#": r"\#", "_": r"\_", "{": r"\{", "}": r"\}",
-                     "~": r"\textasciitilde{}", "^": r"\textasciicircum{}"}
-    return "".join(substitutions.get(character, character) for character in value)
 
 
 def read_json(path: Path) -> Any:
@@ -132,14 +125,6 @@ def validate_sources(analysis: Path, summary: dict[str, Any]) -> dict[str, Any]:
     return sources
 
 
-def table(caption: str, label: str, columns: str, header: str, body: list[str], wide: bool = False) -> str:
-    environment = "table*" if wide else "table"
-    return "\n".join([f"\\begin{{{environment}}}[t]", r"\centering", r"\small",
-        f"\\caption{{{caption}}}", f"\\label{{{label}}}", f"\\begin{{tabular}}{{{columns}}}",
-        r"\toprule", header + r" \\", r"\midrule", *body, r"\bottomrule",
-        r"\end{tabular}", f"\\end{{{environment}}}", ""])
-
-
 def build_tables(analysis: str | Path, output: str | Path) -> dict[str, Any]:
     analysis, output = Path(analysis).resolve(), Path(output).resolve()
     if output == analysis or analysis.is_relative_to(output):
@@ -186,7 +171,7 @@ def build_tables(analysis: str | Path, output: str | Path) -> dict[str, Any]:
 
     aggregates = indexed(read_csv(analysis / "aggregate_metrics.csv"), ("pilot_fraction", "policy"),
                          set(itertools.product(FRACTIONS, POLICIES)), "aggregate")
-    main_body = []
+    main_rows = []
     for fraction in FRACTIONS:
         for policy in POLICIES:
             row = aggregates[(fraction, policy)]
@@ -199,17 +184,19 @@ def build_tables(analysis: str | Path, output: str | Path) -> dict[str, Any]:
             close(number(row, "equal_environment_seed_nmse_db"), mean, "aggregate NMSE mean")
             close(number(row, "descriptive_sd_nmse_db"), sd, "aggregate NMSE SD")
             close(number(row, "equal_environment_seed_channel_nrmse_percent"), statistics.mean(nrmse), "aggregate NRMSE")
-            ratio_label = {0.0625: "1/16", 0.125: "1/8", 0.25: "1/4"}[fraction]
-            main_body.append(f"{ratio_label} & {LABELS[policy]} & ${mean:.2f} \\pm {sd:.2f}$ & ${statistics.mean(nrmse):.1f} \\pm {statistics.pstdev(nrmse):.1f}$ " + r"\\")
-        if fraction != FRACTIONS[-1]:
-            main_body.append(r"\addlinespace")
+            main_rows.append({
+                "pilot_fraction": fraction, "policy": policy, "num_environment_seed_cells": len(group),
+                "nmse_db_mean": mean, "nmse_db_sd": sd,
+                "channel_nrmse_percent_mean": statistics.mean(nrmse),
+                "channel_nrmse_percent_sd": statistics.pstdev(nrmse),
+            })
 
     pairs = indexed(read_csv(analysis / "paired_top_b_025.csv"), ("environment", "seed"),
                     set(itertools.product(ENVIRONMENTS, SEEDS)), "top-B paired")
     environment_rows = [row for row in read_csv(analysis / "paired_by_environment.csv")
                         if row.get("policy") == "uncertainty" and number(row, "pilot_fraction") == 0.25]
     environment_pairs = indexed(environment_rows, ("environment",), {(env,) for env in ENVIRONMENTS}, "paired environment")
-    paired_body, deltas, excluded_pairs = [], {}, 0
+    pair_rows, deltas, excluded_pairs = [], {}, 0
     for env in ENVIRONMENTS:
         values = []
         for seed in SEEDS:
@@ -251,8 +238,9 @@ def build_tables(analysis: str | Path, output: str | Path) -> dict[str, Any]:
         if integer(env_row, "num_seeds") != 3 or integer(env_row, "undefined_seed_count") != 0:
             raise ValueError("Each environment must have three defined paired seed outcomes.")
         close(number(env_row, "mean_delta_db"), statistics.mean(values), "paired environment mean")
-        paired_body.append(latex_escape(env) + " & " + " & ".join(f"${value:+.3f}$" for value in values)
-                           + f" & ${statistics.mean(values):+.3f}$ " + r"\\")
+        pair_rows.append({"environment": env,
+                          **{f"seed_{seed}_delta_db": value for seed, value in zip(SEEDS, values)},
+                          "mean_delta_db": statistics.mean(values)})
     totals = read_json(analysis / "paired_summary.json")
     chosen = [row for row in totals if row.get("policy") == "uncertainty" and number(row, "pilot_fraction") == 0.25]
     if len(chosen) != 1:
@@ -277,9 +265,8 @@ def build_tables(analysis: str | Path, output: str | Path) -> dict[str, Any]:
     rankings = indexed(ranking_rows, ("environment", "pilot_fraction"), set(itertools.product(ENVIRONMENTS, FRACTIONS)), "ranking environment")
     run_rank_rows = [row for row in read_csv(analysis / "prior_ranking_by_run.csv") if row.get("policy") == "uncertainty"]
     run_rankings = indexed(run_rank_rows, ("environment", "seed", "pilot_fraction"), cells, "ranking run")
-    ranking_body, undefined_ranks = [], 0
+    ranking_rows_out, undefined_ranks = [], 0
     for env in ENVIRONMENTS:
-        entries = []
         for fraction in FRACTIONS:
             row = rankings[(env, fraction)]
             if integer(row, "num_seeds") != 3:
@@ -307,44 +294,32 @@ def build_tables(analysis: str | Path, output: str | Path) -> dict[str, Any]:
             if len(values) == len(SEEDS):
                 rho = number(row, "equal_seed_mean_frame_spearman")
                 close(rho, statistics.mean(values), "environment ranking mean")
-                rho_text = f"${rho:+.3f}$"
             elif row.get("equal_seed_mean_frame_spearman") not in ("", None):
                 raise ValueError("A three-seed ranking cannot omit a seed with no defined frame correlations.")
             else:
-                rho_text = r"\textsc{na}"
+                rho = None
             undefined = integer(row, "num_undefined_frames")
             if undefined != sum(integer(item, "num_undefined_frames") for item in group):
                 raise ValueError("Ranking undefined-frame counts differ across summaries.")
             undefined_ranks += undefined
-            entries.append(f"{rho_text} ({undefined})")
-        ranking_body.append(latex_escape(env) + " & " + " & ".join(entries) + " " + r"\\")
+            ranking_rows_out.append({
+                "environment": env, "pilot_fraction": fraction,
+                "equal_seed_mean_frame_spearman": rho, "num_defined_seeds": len(values),
+                "num_undefined_frames": undefined,
+            })
 
-    mode_caption = "Fresh training" if summary["run_mode"] == "fresh_training" else "Fixed-checkpoint reevaluation"
-    main_caption = (f"{mode_caption}: Watermark post-update channel errors over four held-out environments and three seeds. "
-        "Each environment--seed outcome receives equal weight. Entries are mean $\\pm$ descriptive standard deviation "
-        "(divisor 12), not confidence intervals. Channel NRMSE is an estimation-error metric, not decoded-symbol EVM.")
-    paired_caption = ("Top-$B$ minus comb NMSE at $B/F=1/4$ (dB); negative values favor top-$B$. "
-        f"Top-$B$ had lower NMSE in {sum(value < 0 for value in deltas.values())} of 12 pairs; "
-        f"the mean difference is ${overall:+.3f}$~dB. "
-        f"The exploratory 95\\% interval over three seed blocks is $[{low:+.3f}, {high:+.3f}]$~dB "
-        "($t$, 2 degrees of freedom), conditional on these four environments. "
-        f"Matched-frame comparisons exclude {excluded_pairs} undefined frame pairs in total.")
-    rank_caption = ("Pre-acquisition Spearman correlation for uncertainty top-$B$. Each value averages three "
-        "seed-specific means of within-frame correlations across frequency. Parentheses give the total number "
-        "of undefined frame correlations across those seeds. NA means at least one seed had no defined correlation.")
-    texts = {
-        "main_results.tex": table(main_caption, "tab:aquapilot-main", "llrr", "Pilot fraction & Policy & NMSE (dB) & Channel NRMSE (\\%)", main_body, wide=True),
-        "paired_top_b_025.tex": table(paired_caption, "tab:aquapilot-paired", "lrrrr", "Environment & Seed 17 & Seed 37 & Seed 57 & Mean", paired_body),
-        "ranking_by_environment.tex": table(rank_caption, "tab:aquapilot-ranking", "lrrr", "Environment & 1/16 & 1/8 & 1/4", ranking_body),
+    paired_summary = {
+        "pilot_fraction": 0.25, "policy": "uncertainty", "reference_policy": "comb",
+        "mean_delta_db": overall, "t95_lower_db": low, "t95_upper_db": high,
+        "num_seed_blocks": len(SEEDS), "degrees_of_freedom": len(SEEDS) - 1,
+        "num_pairs": len(deltas), "wins": sum(value < 0 for value in deltas.values()),
+        "ties": sum(value == 0 for value in deltas.values()),
+        "losses": sum(value > 0 for value in deltas.values()), "excluded_frames": excluded_pairs,
+        **{f"seed_{seed}_mean_delta_db": substantiated["seed_block_means_db"][seed] for seed in SEEDS},
     }
-    notes = ["Watermark tables (LaTeX: booktabs)",
-             "Main table: equal weight per environment and seed. NMSE and channel NRMSE are means of frame errors; SD uses divisor 12.",
-             "Paired interval: 95% t interval over three joint training/replay seed means, each averaged across four fixed environments (df = 2).",
-             "Ranking: pre-acquisition Spearman correlation across frequency within a snapshot.",
-             f"Undefined full-band error frames: {excluded_errors}. Excluded 1/4 frame pairs: {excluded_pairs}. Undefined top-B ranks: {undefined_ranks}.",
-             "Absolute errors and references: baseline_comparisons.csv and error_flags.csv."]
-    texts["table_notes.txt"] = "\n".join(notes) + "\n"
-    manifest = {"table_schema_version": 1, "protocol_id": PROTOCOL_ID, "protocol_fingerprint": summary["protocol_fingerprint"],
+    tables = {"main_results.csv": main_rows, "paired_top_b_025.csv": pair_rows,
+              "paired_summary_025.csv": [paired_summary], "ranking_by_environment.csv": ranking_rows_out}
+    manifest = {"table_schema_version": 2, "protocol_id": PROTOCOL_ID, "protocol_fingerprint": summary["protocol_fingerprint"],
                 "run_mode": summary["run_mode"], "data_kind": "prepared", "artifact_status": summary["artifact_status"],
                 "num_cells": 36, "analysis_directory": str(analysis),
                 "analysis_files": {name: file_fingerprint(analysis / name) for name in INPUT_FILES},
@@ -352,11 +327,18 @@ def build_tables(analysis: str | Path, output: str | Path) -> dict[str, Any]:
                 "builder": file_fingerprint(Path(__file__)), "main_sd_ddof": 0,
                 "undefined_error_frames": excluded_errors, "undefined_paired_frames": excluded_pairs,
                 "undefined_rank_frames": undefined_ranks}
-    output.mkdir(parents=True, exist_ok=True)
-    for name, text in texts.items():
-        (output / name).write_text(text, encoding="utf-8")
-    manifest["outputs"] = {name: file_fingerprint(output / name) for name in texts}
-    save_json(output / "tables_manifest.json", manifest)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".watermark-tables-", dir=output.parent) as directory:
+        stage = Path(directory) / "tables"
+        stage.mkdir()
+        for name, rows in tables.items():
+            with (stage / name).open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(rows[0]), lineterminator="\n")
+                writer.writeheader()
+                writer.writerows(rows)
+        manifest["outputs"] = {name: file_fingerprint(stage / name) for name in tables}
+        save_json(stage / "tables_manifest.json", manifest)
+        stage.replace(output)
     return manifest
 
 

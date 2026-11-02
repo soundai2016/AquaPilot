@@ -1,68 +1,40 @@
 # AquaPilot
 
-**Uncertainty-Guided Adaptive Pilot Placement for Underwater Acoustic OFDM**  
-
-AquaPilot studies adaptive pilot placement for underwater acoustic OFDM under a fixed pilot budget. The receiver predicts the complex channel frequency response from 16 previous soundings and uses the forecast to select pilot subcarriers. Evaluation uses replay of measured channels from the Watermark dataset.
-
-## Pilot placement
-
-Four strategies are evaluated at the same pilot count:
-
-- **Comb:** rotating, regularly spaced pilots.
-- **Random:** randomly selected pilot subcarriers.
-- **Top-B:** subcarriers ranked by predicted pre-acquisition uncertainty.
-- **A-optimal:** greedy pilot selection using an A-optimality criterion.
-
-Within each experimental configuration, the strategies share a trained checkpoint and initial observations. Their subsequent observation histories differ according to the pilots selected.
-
-## Experimental protocol
-
-The Watermark experiment includes four held-out environments, three pilot budgets (8, 16, and 32 of 128 subcarriers), and three random seeds (17, 37, and 57): **36 training configurations** in total. All four placement strategies are evaluated for each configuration.
-
-The original Watermark recordings are available from the [Norwegian Defence Research Establishment (FFI)](https://www.ffi.no/en/research/watermark). See [data/README.md](data/README.md) for data layout, preparation, and source information. Original recordings and trained checkpoints are not included in the release package.
-
-## Installation and reproduction
+## Setup
 
 ```bash
-git clone https://github.com/soundai2016/AquaPilot.git
-cd AquaPilot
+cd /data/AquaPilot
+conda activate aqua
 python -m pip install -e .
+```
 
-# Prepare and validate the Watermark data.
+## Data
+
+Place the original Watermark data under `data/raw/`. Keep the original files unchanged. Prepared folds are written to `data/prepared/`.
+
+```bash
+cd /data/AquaPilot
 bash run.sh --prepare
-bash run.sh --check-data --device cuda
-
-# Inspect the experiment matrix, or launch training.
-bash run.sh --dry-run
-bash run.sh --device cuda --background --export-tables
 ```
 
-Preparation writes to `data/prepared/watermark_inband/`. Experiment outputs and logs are stored in `results/watermark_inband/`. The training command requires a CUDA-enabled environment.
+## Train and evaluate
 
-After training finishes, export the results:
+Run the four leave-one-environment-out folds at the 32/128 pilot budget with seeds 17, 37, and 57:
 
 ```bash
-python scripts/export_results.py
+cd /data/AquaPilot
+bash run.sh --quarter-budget --device cuda --background --skip-existing
 ```
 
-The exporter writes `results/AquaPilot_analysis.zip` and checks the available experiment evidence. Only complete, verified in-band experiments should be used for formal reporting; earlier and partial runs remain diagnostic.
+Training and evaluation artifacts are stored under `results/watermark_quarter/`.
 
-## Evaluation and scope
-
-- **Channel NMSE (dB):** mean of per-snapshot log ratios of squared complex estimation error to reference channel energy.
-- **Channel NRMSE (%):** normalized channel-estimation error, **not** demodulated-symbol EVM.
-- **Paired comparison:** a negative Top-B minus Comb difference favors Top-B.
-- **Uncertainty ranking:** within-sounding Spearman correlation between predicted pre-acquisition variance and squared forecast error across subcarriers.
-
-These evaluations concern **channel estimation**. Packet delivery and feedback delay are not measured by this protocol.
-
-## Tests
+## Export results
 
 ```bash
-python -m pip install -e '.[dev]'
-python -m pytest -q
+cd /data/AquaPilot
+python scripts/export_quarter.py \
+  --results results/watermark_quarter/aquapilot \
+  --axes results/axes.json
 ```
 
-## License
-
-Released under the [MIT License](LICENSE).
+The export produces `results/AquaPilot_quarter_results.zip`, including the paired comparison CSV, run manifest, and report.

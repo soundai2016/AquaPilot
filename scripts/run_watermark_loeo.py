@@ -28,6 +28,7 @@ DEFAULT_FOLDS = ("fold_test_NOF", "fold_test_NCS", "fold_test_BCH", "fold_test_K
 DEFAULT_RATIOS = (0.25, 0.125, 0.0625)
 DEFAULT_SEEDS = (17, 37, 57)
 DEFAULT_RESULTS_ROOT = "results/watermark_inband"
+QUARTER_RESULTS_ROOT = "results/watermark_quarter"
 DEFAULT_RAW_ROOT = "data/raw/watermark/WatermarkV1/Watermark/input/channels"
 
 
@@ -100,12 +101,17 @@ def write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
             Path(temporary).unlink()
 
 
-def add_matrix_arguments(parser: argparse.ArgumentParser, *, results_root: str) -> None:
+def add_matrix_arguments(parser: argparse.ArgumentParser, *, results_root: str, allow_quarter: bool = False) -> None:
     parser.add_argument("--config", type=Path, default=Path("configs/watermark.yaml"))
     parser.add_argument("--prepared-root", type=Path, default=Path("data/prepared/watermark_inband"))
-    parser.add_argument("--results-root", type=Path, default=Path(results_root))
+    parser.add_argument("--results-root", type=Path, default=None if allow_quarter else Path(results_root))
     parser.add_argument("--folds", nargs="+", default=list(DEFAULT_FOLDS))
-    parser.add_argument("--pilot-ratios", nargs="+", type=float, default=list(DEFAULT_RATIOS))
+    budgets = parser
+    if allow_quarter:
+        budgets = parser.add_mutually_exclusive_group()
+        budgets.add_argument("--quarter-budget", action="store_true",
+                             help="Train all four folds and three seeds with 32 of 128 pilots, then report the 12 paired outcomes")
+    budgets.add_argument("--pilot-ratios", nargs="+", type=float, default=list(DEFAULT_RATIOS))
     parser.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS))
     parser.add_argument("--skip-existing", action="store_true", help="Reuse only completed runs with identical verified inputs and evaluator")
     parser.add_argument("--dry-run", action="store_true", help="Print the plan without reading datasets or writing outputs")
@@ -151,21 +157,25 @@ def save_plan(path: Path, plan: list[dict[str, Any]]) -> None:
 
 def parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_matrix_arguments(parser, results_root=DEFAULT_RESULTS_ROOT)
+    add_matrix_arguments(parser, results_root=DEFAULT_RESULTS_ROOT, allow_quarter=True)
     parser.add_argument("--prepare", action="store_true", help="Prepare and verify the in-band Watermark folds, then exit without training")
     parser.add_argument("--raw-root", type=Path, metavar="DIR", help=f"Raw channel directory for --prepare (default: {DEFAULT_RAW_ROOT})")
-    parser.add_argument("--axes", type=Path, help="Raw-to-prepared verification receipt (default: RESULTS_ROOT/axes.json)")
+    parser.add_argument("--axes", type=Path, help="Raw-to-prepared receipt (default: RESULTS_ROOT/axes.json; quarter-budget uses results/watermark_inband/axes.json)")
     parser.add_argument("--device", help="Override train.device: auto, cpu, cuda, or cuda:N")
     parser.add_argument("--check-data", action="store_true", help="Check the existing prepared folds and runtime, then exit without writing results")
     parser.add_argument("--background", action="store_true", help="Validate data/runtime first, then start a detached training process")
-    parser.add_argument("--export-tables", action="store_true", help="Export verified LaTeX tables after a complete 36-run matrix")
+    parser.add_argument("--export-results", "--export-tables", dest="export_tables", action="store_true",
+                        help="Export a verified numerical bundle after a complete 36-run matrix")
     parser.add_argument("--session-id", help=argparse.SUPPRESS)
     parser.add_argument("--lock-fd", type=int, help=argparse.SUPPRESS)
     return parser
 
 
 def axes_path(args: argparse.Namespace) -> Path:
-    return project_path(args.axes if args.axes is not None else args.results_root / "axes.json")
+    if args.axes is not None:
+        return project_path(args.axes)
+    root = DEFAULT_RESULTS_ROOT if args.quarter_budget else (args.results_root or DEFAULT_RESULTS_ROOT)
+    return project_path(root) / "axes.json"
 
 
 def prepare_inputs(args: argparse.Namespace) -> None:
@@ -276,6 +286,13 @@ def validate_output_paths(args: argparse.Namespace, base: dict[str, Any], plan: 
         if destination.is_relative_to(protected) or protected.is_relative_to(destination):
             raise ValueError(f"Training results must be separate from data: {destination}")
     existing_plan = destination / "run_plan.json"
+    if args.quarter_budget:
+        root = project_path(args.results_root)
+        if any((p / "run_plan.json").is_file() for p in (root, *root.parents)) or any(
+                (p / "aquapilot/run_plan.json").is_file() for p in root.parents):
+            raise ValueError("Quarter-budget output must be outside other experiment directories.")
+        if destination.exists() and any(destination.iterdir()) and not existing_plan.is_file():
+            raise ValueError("Quarter-budget output contains results without a matching run plan; choose a new --results-root.")
     expected = {"protocol_id": PROTOCOL_ID, "runs": plan}
     if existing_plan.exists() and json.loads(existing_plan.read_text(encoding="utf-8")) != expected:
         raise ValueError(f"{existing_plan} describes a different matrix; choose a new --results-root.")
@@ -375,7 +392,7 @@ def full_matrix(plan: list[dict[str, Any]]) -> bool:
     return {(item["fold"], item["pilot_ratio"], item["seed"]) for item in plan} == expected
 
 
-def postprocess(destination: Path, plan: list[dict[str, Any]], export_tables: bool) -> None:
+def postprocess(destination: Path, plan: list[dict[str, Any]], export_tables: bool, *, axes: Path | None = None) -> None:
     complete = full_matrix(plan)
     summary = [sys.executable, str(PROJECT_ROOT / "scripts/summarize_watermark.py"), "--input", str(destination / "aggregate_runs.csv")]
     if not complete:
@@ -389,9 +406,10 @@ def postprocess(destination: Path, plan: list[dict[str, Any]], export_tables: bo
     if export_tables:
         if not complete:
             raise ValueError("Table export requires the complete 36-run matrix.")
-        subprocess.run([sys.executable, str(PROJECT_ROOT / "scripts/build_result_tables.py"),
-                        "--analysis", str(destination / "analysis"), "--output", str(destination / "tables")],
-                       cwd=PROJECT_ROOT, check=True)
+        export = [sys.executable, str(PROJECT_ROOT / "scripts/export_results.py"), "--results", str(destination)]
+        if axes is not None:
+            export.extend(["--axes", str(axes)])
+        subprocess.run(export, cwd=PROJECT_ROOT, check=True)
 
 
 def execute_matrix(args: argparse.Namespace, base: dict[str, Any], plan: list[dict[str, Any]], report: dict[str, Any]) -> None:
@@ -417,7 +435,12 @@ def execute_matrix(args: argparse.Namespace, base: dict[str, Any], plan: list[di
             _status(paths, "running", completed_runs=len(rows), total_runs=len(plan), results_root=str(destination),
                     latest_completed=item, elapsed_seconds=time.monotonic() - start)
         _status(paths, "analyzing", completed_runs=len(rows), total_runs=len(plan), results_root=str(destination))
-        postprocess(destination, plan, args.export_tables)
+        if args.quarter_budget:
+            from scripts.export_quarter import export_quarter
+            bundle = export_quarter(destination, axes_path(args), PROJECT_ROOT / "results/AquaPilot_quarter_results.zip")
+            print(f"Verified quarter-budget results: {bundle}", flush=True)
+        else:
+            postprocess(destination, plan, args.export_tables, axes=axes_path(args))
         _status(paths, "completed", completed_runs=len(rows), total_runs=len(plan), results_root=str(destination),
                 elapsed_seconds=time.monotonic() - start)
     except BaseException as exc:
@@ -433,6 +456,17 @@ def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     command_parser = parser()
     args = command_parser.parse_args(argv)
+    if args.results_root is None:
+        args.results_root = Path(QUARTER_RESULTS_ROOT if args.quarter_budget else DEFAULT_RESULTS_ROOT)
+    if args.quarter_budget:
+        if sorted(args.folds) != sorted(DEFAULT_FOLDS) or sorted(args.seeds) != sorted(DEFAULT_SEEDS):
+            command_parser.error("--quarter-budget requires all four Watermark folds and seeds 17, 37 and 57.")
+        if args.export_tables:
+            command_parser.error("--export-results is for the 36-run matrix. --quarter-budget automatically exports its paired results.")
+        root, full_root = project_path(args.results_root), project_path(DEFAULT_RESULTS_ROOT)
+        if root.is_relative_to(full_root) or full_root.is_relative_to(root):
+            command_parser.error("--quarter-budget needs a separate output tree; use the default results/watermark_quarter or another --results-root.")
+        args.folds, args.pilot_ratios, args.seeds = list(DEFAULT_FOLDS), [0.25], list(DEFAULT_SEEDS)
     if sum((args.prepare, args.dry_run, args.check_data, args.background)) > 1:
         command_parser.error("Use --prepare, --dry-run, --check-data, or --background separately.")
     if args.raw_root is not None and not args.prepare:
@@ -446,9 +480,14 @@ def main(argv: list[str] | None = None) -> None:
     if args.lock_fd is not None and args.session_id is None:
         command_parser.error("An inherited lock requires a session identifier.")
     base = load_fresh_config(args)
+    if args.quarter_budget:
+        data = base["data"]
+        if (base["model"].get("kind", "aquapilot") != "aquapilot" or data.get("n_subcarriers", 128) != 128 or
+                data.get("history", 8) != 16 or base["pilot"].get("update_noise_convention", "component") != "component"):
+            command_parser.error("--quarter-budget requires AquaPilot, 128 tones, a 16-sounding history and component noise.")
     plan = build_plan(args, base)
     if args.export_tables and not full_matrix(plan):
-        command_parser.error("--export-tables requires all four folds, three pilot fractions, and three seeds.")
+        command_parser.error("--export-results requires all four folds, three pilot fractions, and three seeds.")
     if args.dry_run:
         print(json.dumps({"mode": "fresh_training", "initialized_from": None,
                           "device": base["train"].get("device", "auto"), "runs": len(plan), "plan": plan}, indent=2))

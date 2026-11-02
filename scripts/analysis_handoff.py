@@ -8,6 +8,7 @@ from pathlib import Path
 import tempfile
 import zipfile
 
+from aquapilot import __version__
 from aquapilot.provenance import PROTOCOL_ID, file_fingerprint
 
 LEGACY = 'aquapilot_closed_loop'
@@ -125,7 +126,7 @@ def handoff(root, args, export_bundle):
     pid = protocol(source)
     if pid not in (PROTOCOL_ID, LEGACY):
         raise ValueError(f'Unrecognized training protocol: {pid!r}. No data were exported.')
-    info = {'format': FORMAT, 'software_version': '1.0', 'protocol_id': pid}
+    info = {'format': FORMAT, 'software_version': __version__, 'protocol_id': pid}
     payload = {}
     with tempfile.TemporaryDirectory(prefix='aquapilot_post_') as temp:
         scratch = Path(temp)
@@ -182,8 +183,7 @@ def handoff(root, args, export_bundle):
                 info.update(classification='verified_corrected', manuscript_eligible=True, num_runs=summary['num_runs'],
                             input_source='run_tree' if source.is_dir() else 'numeric_archive')
                 text = ('Corrected in-band Watermark experiment.\n'
-                        'results.zip: numerical tables and paired comparisons. axes.json: raw-to-CFR verification.\n'
-                        'verified_source/: paper and reviewer-response sources populated from this run.\n')
+                        'results.zip: numerical tables and paired comparisons. axes.json: raw-to-CFR verification.\n')
         payload['READ_ME.txt'] = text.encode()
         info['members'] = {n: {'size_bytes': len(b), 'sha256': hashlib.sha256(b).hexdigest()} for n,b in sorted(payload.items())}
         payload['export_manifest.json'] = json_bytes(info)
